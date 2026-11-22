@@ -1,0 +1,1409 @@
+# Optional LVGL debug UI for wled_emu.
+#
+# Pages for a small landscape screen (designed for 240×135):
+#   Status   — IP, Wi-Fi, sync flags + group masks, the last packet received
+#              (kind, result, values, sender), counters; a round LED mirrors
+#              the bound light (colour, brightness, effects)
+#   Send     — broadcast a notifier (colours, pulse, strobe, off) to the send
+#              groups, or the light's own state
+#   Lamp     — change the bound light locally (sent on to peers when
+#              "Send" sync is on)
+#   Net      — Wi-Fi, IP and the WLED peers heard; "Forget Wi-Fi" reboots
+#              into Improv
+#   Settings — sync options, sync groups, flip the screen 180°, deep-sleep
+#              timeout (screen goes off)
+#
+# Two buttons: the left one moves the focus to the next button, the right one
+# presses it. With the screen flipped the buttons swap roles, so "left" and
+# "right" stay where the user sees them. After the chosen time without a
+# button press the device turns the backlight off and enters deep sleep;
+# either button wakes it (configure the wakeup pins in `deep_sleep:` of your
+# device config). The wake-up press is not passed on to the UI.
+#
+# Include it with:
+#   packages:
+#     wled_ui: !include
+#       file: <path>/esphome-wled-emu/ui/lvgl_debug.yaml
+#       vars:
+#         wled_id: wled              # wled_emu id
+#         light_id: lamp             # the light bound to wled_emu (light_id)
+#         display_id: lcd            # display driving LVGL
+#         rotation: "90"             # landscape rotation when not flipped
+#         key_left: btn_left         # binary_sensor of the left button
+#         key_right: btn_right       # binary_sensor of the right button
+#         backlight_id: backlight    # light switching the backlight
+#         deep_sleep_id: deep_sleep_ctl
+#
+# Requires wled_emu with a bound RGB light, wifi, a display, a backlight
+# light, two binary sensors and a deep_sleep component (ESP32, esp-idf).
+
+defaults:
+  wled_id: wled
+  light_id: lamp
+  display_id: lcd
+  rotation: "90"
+  key_left: btn_left
+  key_right: btn_right
+  backlight_id: backlight
+  deep_sleep_id: deep_sleep_ctl
+
+# "Forget Wi-Fi" erases the network stored by Improv straight from NVS.
+esphome:
+  includes:
+    - <nvs.h>
+
+globals:
+  - id: wl_ui_msg
+    type: std::string
+    initial_value: '""'
+  # ── persisted settings ──
+  - id: wl_ui_flip
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # Deep sleep after no button press: 0=30s 1=1m 2=3m 3=5m 4=never
+  - id: wl_ui_sleep_idx
+    type: uint8_t
+    restore_value: true
+    initial_value: '3'
+  # ── runtime ──
+  - id: wl_ui_last_act
+    type: uint32_t
+    initial_value: '0'
+  # Set while the button that woke the device is still held: ignored until
+  # released, so waking never clicks anything.
+  - id: wl_ui_swallow
+    type: bool
+    initial_value: 'false'
+
+# Logical keys for the LVGL keypad: physical buttons mapped by orientation,
+# silenced while the wake-up press is still held.
+binary_sensor:
+  - platform: template
+    id: wl_key_next
+    internal: true
+    lambda: |-
+      bool raw = id(wl_ui_flip) ? id(${key_right}).state : id(${key_left}).state;
+      return raw && !id(wl_ui_swallow);
+  - platform: template
+    id: wl_key_enter
+    internal: true
+    lambda: |-
+      bool raw = id(wl_ui_flip) ? id(${key_left}).state : id(${key_right}).state;
+      return raw && !id(wl_ui_swallow);
+
+script:
+  # Send page: broadcast a notifier to the send groups and show the outcome.
+  - id: wl_ui_send
+    mode: queued
+    parameters:
+      turn_on: bool
+      r: int
+      g: int
+      b: int
+      fx: int
+    then:
+      - lambda: |-
+          auto *w = id(${wled_id});
+          bool ok = w->send_notifier(turn_on, 200, r, g, b, fx);  // fx: WLED effect ID
+          char m[48];
+          if (!w->get_sync_enable())
+            snprintf(m, sizeof(m), "not sent: sync is off");
+          else
+            snprintf(m, sizeof(m), "%s grp %02X: %s", turn_on ? "sent" : "off", w->get_send_groups(),
+                     ok ? "ok" : "FAILED");
+          id(wl_ui_msg) = m;
+      - lvgl.label.update:
+          id: wl_lbl_send_msg
+          text: !lambda 'return id(wl_ui_msg);'
+
+  # Lamp page: change the bound light locally.
+  - id: wl_ui_lamp
+    mode: queued
+    parameters:
+      turn_on: bool
+      r: float
+      g: float
+      b: float
+      effect: std::string
+    then:
+      - lambda: |-
+          auto *l = id(${light_id});
+          if (!turn_on) {
+            l->turn_off().perform();
+          } else {
+            auto call = l->turn_on();
+            call.set_brightness(0.8f);
+            call.set_rgb(r, g, b);
+            call.set_effect(effect);
+            call.perform();
+          }
+          auto *w = id(${wled_id});
+          id(wl_ui_msg) = (w->get_sync_enable() && w->get_sync_send()) ? "changed - sent to peers"
+                                                                      : "changed locally (Send sync off)";
+      - lvgl.label.update:
+          id: wl_lbl_lamp_msg
+          text: !lambda 'return id(wl_ui_msg);'
+
+  # Keypad focus: only the visible buttons of the page being shown.
+  - id: wl_ui_focus_page
+    parameters:
+      page: int
+    then:
+      - lambda: |-
+          lv_group_t *g = id(wl_ui_group);
+          lv_group_remove_all_objs(g);
+          lv_obj_t *pages[] = {id(wl_page_status)->obj, id(wl_page_send)->obj, id(wl_page_lamp)->obj,
+                               id(wl_page_net)->obj, id(wl_page_settings)->obj, id(wl_page_sleep)->obj,
+                               id(wl_page_sync)->obj, id(wl_page_groups)->obj};
+          lv_obj_t *p = pages[page % 8];
+          for (uint32_t i = 0; i < lv_obj_get_child_count(p); i++) {
+            lv_obj_t *c = lv_obj_get_child(p, (int32_t) i);
+            if (lv_obj_check_type(c, &lv_button_class) && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+              lv_group_add_obj(g, c);
+          }
+
+  # Orientation: base rotation, or +180° when flipped.
+  - id: wl_ui_apply_rotation
+    then:
+      - lambda: 'id(wl_lvgl)->set_rotation(${rotation} + (id(wl_ui_flip) ? 180 : 0));'
+
+  # Settings / sync / groups pages: show the current values.
+  - id: wl_ui_mark_choices
+    then:
+      - lambda: |-
+          auto mark = [](lv_obj_t *o, bool on) {
+            if (on) lv_obj_add_state(o, LV_STATE_CHECKED);
+            else lv_obj_remove_state(o, LV_STATE_CHECKED);
+          };
+          auto *w = id(${wled_id});
+          lv_obj_t *slp[] = {id(wl_btn_slp0), id(wl_btn_slp1), id(wl_btn_slp2), id(wl_btn_slp3), id(wl_btn_slp4)};
+          for (int i = 0; i < 5; i++) mark(slp[i], i == id(wl_ui_sleep_idx));
+          static const char *SLP[5] = {"30s", "1m", "3m", "5m", "never"};
+          char b[40];
+          snprintf(b, sizeof(b), "Sleep after: %s >", SLP[id(wl_ui_sleep_idx) % 5]);
+          lv_label_set_text(id(wl_lbl_set_sleep), b);
+          lv_label_set_text(id(wl_lbl_set_flip), id(wl_ui_flip) ? "Flip screen: ON" : "Flip screen: OFF");
+          // Sync options.
+          mark(id(wl_btn_sy_enable), w->get_sync_enable());
+          mark(id(wl_btn_sy_send), w->get_sync_send());
+          mark(id(wl_btn_sy_recv), w->get_sync_receive());
+          mark(id(wl_btn_sy_bri), w->get_receive_brightness());
+          mark(id(wl_btn_sy_fx), w->get_receive_effects());
+          mark(id(wl_btn_sy_change), w->get_send_on_change());
+          mark(id(wl_btn_sy_retx), w->get_retransmit());
+          // Groups.
+          lv_obj_t *gs[] = {id(wl_btn_gs1), id(wl_btn_gs2), id(wl_btn_gs3), id(wl_btn_gs4),
+                            id(wl_btn_gs5), id(wl_btn_gs6), id(wl_btn_gs7), id(wl_btn_gs8)};
+          lv_obj_t *gr[] = {id(wl_btn_gr1), id(wl_btn_gr2), id(wl_btn_gr3), id(wl_btn_gr4),
+                            id(wl_btn_gr5), id(wl_btn_gr6), id(wl_btn_gr7), id(wl_btn_gr8)};
+          for (int i = 0; i < 8; i++) {
+            mark(gs[i], w->get_send_groups() & (1u << i));
+            mark(gr[i], w->get_receive_groups() & (1u << i));
+          }
+          snprintf(b, sizeof(b), "send 0x%02X   receive 0x%02X", w->get_send_groups(), w->get_receive_groups());
+          lv_label_set_text(id(wl_lbl_groups), b);
+
+  # Round LED on the Status page: follows the light's actual output.
+  - id: wl_ui_led
+    then:
+      - lambda: |-
+          auto &v = id(${light_id})->current_values;
+          float bri = v.is_on() ? v.get_brightness() * v.get_state() : 0.0f;
+          lv_color_t c = lv_color_make((uint8_t) (v.get_red() * 255), (uint8_t) (v.get_green() * 255),
+                                       (uint8_t) (v.get_blue() * 255));
+          for (lv_obj_t *led : {id(wl_led), id(wl_led_lamp)}) {
+            if (bri <= 0.004f) {
+              lv_led_off(led);
+              continue;
+            }
+            lv_led_set_color(led, c);
+            lv_led_set_brightness(led, (uint8_t) (80 + bri * 175));
+          }
+
+  # Refresh the status / net labels (1 s interval and on page load).
+  - id: wl_ui_refresh
+    then:
+      - lambda: |-
+          auto *w = id(${wled_id});
+          char b[64];
+          std::string ip = "-";
+          for (auto &a : wifi::global_wifi_component->wifi_sta_ip_addresses()) {
+            if (a.is_set() && a.is_ip4()) {
+              char buf[network::IP_ADDRESS_BUFFER_SIZE];
+              ip = a.str_to(buf);
+              break;
+            }
+          }
+          bool up = wifi::global_wifi_component->is_connected();
+          char ssid_buf[wifi::SSID_BUFFER_SIZE] = "";
+          std::string ssid = up ? wifi::global_wifi_component->wifi_ssid_to(ssid_buf) : "";
+          int rssi = up ? wifi::global_wifi_component->wifi_rssi() : 0;
+
+          // Status page.
+          lv_label_set_text(id(wl_lbl_title), up ? ("WLED " + ip).c_str() : "WLED - no Wi-Fi");
+          if (up)
+            snprintf(b, sizeof(b), "Wi-Fi %s %ddBm", ssid.c_str(), rssi);
+          else
+            snprintf(b, sizeof(b), "Wi-Fi: send it via Improv");
+          lv_label_set_text(id(wl_lbl_wifi), b);
+          snprintf(b, sizeof(b), "Sync %s TX %s RX %s", w->get_sync_enable() ? "on" : "OFF",
+                   w->get_sync_send() ? "on" : "off", w->get_sync_receive() ? "on" : "off");
+          lv_label_set_text(id(wl_lbl_sync), b);
+          snprintf(b, sizeof(b), "S%02X R%02X peers %u rx %u tx %u", w->get_send_groups(), w->get_receive_groups(),
+                   (unsigned) w->node_count(), (unsigned) w->rx_count(), (unsigned) w->tx_count());
+          lv_label_set_text(id(wl_lbl_groups_st), b);
+          uint32_t age = w->last_rx_age_ms();
+          if (w->last_rx_kind().empty()) {
+            lv_label_set_text(id(wl_lbl_rx), "RX: nothing yet");
+            lv_label_set_text(id(wl_lbl_rx2), "");
+          } else {
+            snprintf(b, sizeof(b), "RX %s %us: %s%s", w->last_rx_kind().c_str(), (unsigned) (age / 1000),
+                     w->last_rx_result().c_str(), w->in_realtime() ? " [RT]" : "");
+            lv_label_set_text(id(wl_lbl_rx), b);
+            std::string d = w->last_rx_detail().empty() ? "from " + w->last_rx_ip()
+                                                         : w->last_rx_detail() + " <" + w->last_rx_ip();
+            lv_label_set_text(id(wl_lbl_rx2), d.c_str());
+          }
+
+          // Net page.
+          if (up)
+            snprintf(b, sizeof(b), "Wi-Fi %s  %d dBm", ssid.c_str(), rssi);
+          else
+            snprintf(b, sizeof(b), "Wi-Fi: not connected (Improv BLE)");
+          lv_label_set_text(id(wl_lbl_net0), b);
+          snprintf(b, sizeof(b), "IP %s  peers %u", ip.c_str(), (unsigned) w->node_count());
+          lv_label_set_text(id(wl_lbl_net1), b);
+          lv_obj_t *rows[] = {id(wl_lbl_net2), id(wl_lbl_net3), id(wl_lbl_net4), id(wl_lbl_net5)};
+          const auto &nodes = w->nodes();
+          for (size_t i = 0; i < 4; i++) {
+            if (i < nodes.size()) {
+              const auto &n = nodes[i];
+              snprintf(b, sizeof(b), "%s %s %s", n.ip.c_str(), (n.type & 0x80) ? "ON " : "off",
+                       n.name.c_str());
+              lv_label_set_text(rows[i], b);
+            } else {
+              lv_label_set_text(rows[i], i == 0 ? "no WLED peers heard yet" : "");
+            }
+          }
+
+lvgl:
+  id: wl_lvgl
+  displays:
+    - ${display_id}
+  rotation: ${rotation}
+  # No PSRAM on most ESP32 boards: a partial buffer is enough at this size.
+  buffer_size: 12%
+  keypads:
+    - group: wl_ui_group
+      next: wl_key_next
+      enter: wl_key_enter
+  # Keypad focus: a red frame stands out against the blue buttons.
+  # Keypad navigation sets FOCUS_KEY (outranks FOCUSED), where the default
+  # theme draws its blue outline — override both. Current choices / enabled
+  # options are CHECKED (green).
+  theme:
+    button:
+      focused:
+        outline_color: 0xFF2020
+        outline_width: 3
+        outline_pad: 1
+      focus_key:
+        outline_color: 0xFF2020
+        outline_width: 3
+        outline_pad: 1
+      checked:
+        bg_color: 0x2E7D32
+  style_definitions:
+    - id: wl_st_line
+      text_font: montserrat_12
+      width: 236
+    - id: wl_st_short
+      text_font: montserrat_12
+      width: 186
+  pages:
+    # ── Status ─────────────────────────────────────────────────────
+    - id: wl_page_status
+      on_load:
+        - script.execute: wl_ui_refresh
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 0
+      widgets:
+        - label:
+            id: wl_lbl_title
+            x: 2
+            y: 0
+            styles: wl_st_short
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "WLED"
+        - label:
+            id: wl_lbl_wifi
+            x: 2
+            y: 18
+            styles: wl_st_short
+            long_mode: dot
+            text: "Wi-Fi: -"
+        - label:
+            id: wl_lbl_sync
+            x: 2
+            y: 36
+            styles: wl_st_short
+            long_mode: dot
+            text: "Sync: -"
+        - label:
+            id: wl_lbl_groups_st
+            x: 2
+            y: 54
+            styles: wl_st_short
+            long_mode: dot
+            text: "Groups: -"
+        - label:
+            id: wl_lbl_rx
+            x: 2
+            y: 72
+            styles: wl_st_line
+            long_mode: dot
+            text: "RX: -"
+        - label:
+            id: wl_lbl_rx2
+            x: 2
+            y: 90
+            styles: wl_st_line
+            long_mode: dot
+            text: ""
+        - led:
+            id: wl_led
+            x: 194
+            y: 8
+            width: 40
+            height: 40
+            color: 0xFFFFFF
+            brightness: 0%
+        - button:
+            x: 2
+            y: 110
+            width: 56
+            height: 24
+            widgets:
+              - label:
+                  text: "Send"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_send
+        - button:
+            x: 61
+            y: 110
+            width: 56
+            height: 24
+            widgets:
+              - label:
+                  text: "Lamp"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_lamp
+        - button:
+            x: 120
+            y: 110
+            width: 58
+            height: 24
+            widgets:
+              - label:
+                  text: "Net"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_net
+        - button:
+            x: 181
+            y: 110
+            width: 57
+            height: 24
+            widgets:
+              - label:
+                  text: ""
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_settings
+
+    # ── Send (broadcast a notifier) ────────────────────────────────
+    - id: wl_page_send
+      on_load:
+        - lvgl.label.update:
+            id: wl_lbl_send_msg
+            text: !lambda |-
+              char b[40];
+              snprintf(b, sizeof(b), "to groups 0x%02X", id(${wled_id})->get_send_groups());
+              return std::string(b);
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 1
+      widgets:
+        - button:
+            x: 2
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Red"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: true
+                  r: 255
+                  g: 0
+                  b: 0
+                  fx: 0
+        - button:
+            x: 122
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Green"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: true
+                  r: 0
+                  g: 255
+                  b: 0
+                  fx: 0
+        - button:
+            x: 2
+            y: 28
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Blue"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: true
+                  r: 0
+                  g: 0
+                  b: 255
+                  fx: 0
+        - button:
+            x: 122
+            y: 28
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "White"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: true
+                  r: 255
+                  g: 255
+                  b: 255
+                  fx: 0
+        - button:
+            x: 2
+            y: 54
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Pulse"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: true
+                  r: 255
+                  g: 160
+                  b: 0
+                  fx: 2
+        - button:
+            x: 122
+            y: 54
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Strobe"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: true
+                  r: 255
+                  g: 255
+                  b: 255
+                  fx: 23
+        - button:
+            x: 2
+            y: 80
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Off"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_send
+                  turn_on: false
+                  r: 0
+                  g: 0
+                  b: 0
+                  fx: 0
+        - button:
+            x: 122
+            y: 80
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Lamp state"
+                  align: CENTER
+            on_click:
+              - lambda: |-
+                  auto *w = id(${wled_id});
+                  w->send_state();
+                  id(wl_ui_msg) = (w->get_sync_enable() && w->get_sync_send()) ? "lamp state sent"
+                                                                              : "not sent: Send sync off";
+              - lvgl.label.update:
+                  id: wl_lbl_send_msg
+                  text: !lambda 'return id(wl_ui_msg);'
+        - button:
+            x: 2
+            y: 110
+            width: 80
+            height: 24
+            widgets:
+              - label:
+                  text: "< Back"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_status
+        - label:
+            id: wl_lbl_send_msg
+            x: 86
+            y: 114
+            width: 152
+            text_font: montserrat_12
+            long_mode: dot
+            text: ""
+
+    # ── Lamp (the bound light, locally) ────────────────────────────
+    - id: wl_page_lamp
+      on_load:
+        - lvgl.label.update:
+            id: wl_lbl_lamp_msg
+            text: !lambda |-
+              auto *w = id(${wled_id});
+              return std::string((w->get_sync_enable() && w->get_sync_send()) ? "changes are sent" : "Send sync off");
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 2
+      widgets:
+        - button:
+            x: 2
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Red"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: true
+                  r: 1.0
+                  g: 0.0
+                  b: 0.0
+                  effect: "None"
+        - button:
+            x: 122
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Green"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: true
+                  r: 0.0
+                  g: 1.0
+                  b: 0.0
+                  effect: "None"
+        - button:
+            x: 2
+            y: 28
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Blue"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: true
+                  r: 0.0
+                  g: 0.0
+                  b: 1.0
+                  effect: "None"
+        - button:
+            x: 122
+            y: 28
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "White"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: true
+                  r: 1.0
+                  g: 1.0
+                  b: 1.0
+                  effect: "None"
+        - button:
+            x: 2
+            y: 54
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Pulse"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: true
+                  r: 1.0
+                  g: 0.6
+                  b: 0.0
+                  effect: "Pulse"
+        - button:
+            x: 122
+            y: 54
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Strobe"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: true
+                  r: 1.0
+                  g: 1.0
+                  b: 1.0
+                  effect: "Strobe"
+        - button:
+            x: 2
+            y: 80
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Off"
+                  align: CENTER
+            on_click:
+              - script.execute:
+                  id: wl_ui_lamp
+                  turn_on: false
+                  r: 0.0
+                  g: 0.0
+                  b: 0.0
+                  effect: "None"
+        - led:
+            id: wl_led_lamp
+            x: 160
+            y: 80
+            width: 24
+            height: 24
+            color: 0xFFFFFF
+            brightness: 0%
+        - button:
+            x: 2
+            y: 110
+            width: 80
+            height: 24
+            widgets:
+              - label:
+                  text: "< Back"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_status
+        - label:
+            id: wl_lbl_lamp_msg
+            x: 86
+            y: 114
+            width: 152
+            text_font: montserrat_12
+            long_mode: dot
+            text: ""
+
+    # ── Net (Wi-Fi + WLED peers) ───────────────────────────────────
+    - id: wl_page_net
+      on_load:
+        - script.execute: wl_ui_refresh
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 3
+      widgets:
+        - label:
+            id: wl_lbl_net0
+            x: 2
+            y: 0
+            styles: wl_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "Wi-Fi"
+        - label:
+            id: wl_lbl_net1
+            x: 2
+            y: 16
+            styles: wl_st_line
+            long_mode: dot
+            text: "IP"
+        - label:
+            id: wl_lbl_net2
+            x: 2
+            y: 36
+            styles: wl_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: wl_lbl_net3
+            x: 2
+            y: 54
+            styles: wl_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: wl_lbl_net4
+            x: 2
+            y: 72
+            styles: wl_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: wl_lbl_net5
+            x: 2
+            y: 90
+            styles: wl_st_line
+            long_mode: dot
+            text: ""
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_status
+        - button:
+            x: 122
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Forget Wi-Fi"
+                  align: CENTER
+            on_click:
+              - logger.log: "Forget Wi-Fi: erasing the stored network and rebooting into Improv"
+              - lambda: |-
+                  // The network stored by Improv lives in the "esphome" NVS
+                  // namespace (Wi-Fi settings + fast-connect keys).
+                  nvs_handle_t h;
+                  if (nvs_open("esphome", NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_erase_key(h, "88491487");
+                    nvs_erase_key(h, "88491488");
+                    nvs_commit(h);
+                    nvs_close(h);
+                  }
+                  App.safe_reboot();
+
+    # ── Settings ───────────────────────────────────────────────────
+    - id: wl_page_settings
+      on_load:
+        - script.execute: wl_ui_mark_choices
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 4
+      widgets:
+        - button:
+            x: 2
+            y: 2
+            width: 236
+            height: 24
+            widgets:
+              - label:
+                  text: "Sync options >"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_sync
+        - button:
+            x: 2
+            y: 28
+            width: 236
+            height: 24
+            widgets:
+              - label:
+                  text: "Sync groups >"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_groups
+        - button:
+            x: 2
+            y: 54
+            width: 236
+            height: 24
+            widgets:
+              - label:
+                  id: wl_lbl_set_flip
+                  text: "Flip screen"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(wl_ui_flip) = !id(wl_ui_flip);'
+              - script.execute: wl_ui_apply_rotation
+              - script.execute: wl_ui_mark_choices
+        - button:
+            x: 2
+            y: 80
+            width: 236
+            height: 24
+            widgets:
+              - label:
+                  id: wl_lbl_set_sleep
+                  text: "Sleep after >"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_sleep
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_status
+
+    # ── Deep-sleep timeout ─────────────────────────────────────────
+    - id: wl_page_sleep
+      on_load:
+        - script.execute: wl_ui_mark_choices
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 5
+      widgets:
+        - label:
+            x: 2
+            y: 0
+            styles: wl_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "Sleep after no button press"
+        - button:
+            id: wl_btn_slp0
+            x: 2
+            y: 18
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "30s"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(wl_ui_sleep_idx) = 0;'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_slp1
+            x: 122
+            y: 18
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "1m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(wl_ui_sleep_idx) = 1;'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_slp2
+            x: 2
+            y: 46
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "3m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(wl_ui_sleep_idx) = 2;'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_slp3
+            x: 122
+            y: 46
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "5m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(wl_ui_sleep_idx) = 3;'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_slp4
+            x: 2
+            y: 74
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Never"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(wl_ui_sleep_idx) = 4;'
+              - script.execute: wl_ui_mark_choices
+        - label:
+            x: 122
+            y: 74
+            width: 116
+            text_font: montserrat_12
+            long_mode: wrap
+            text: "Wake: press either button"
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Settings"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_settings
+
+    # ── Sync options (green = on) ──────────────────────────────────
+    - id: wl_page_sync
+      on_load:
+        - script.execute: wl_ui_mark_choices
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 6
+      widgets:
+        - button:
+            id: wl_btn_sy_enable
+            x: 2
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Sync"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_sync_enable(!id(${wled_id})->get_sync_enable());'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_sy_send
+            x: 122
+            y: 2
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Send"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_sync_send(!id(${wled_id})->get_sync_send());'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_sy_recv
+            x: 2
+            y: 28
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Receive"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_sync_receive(!id(${wled_id})->get_sync_receive());'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_sy_bri
+            x: 122
+            y: 28
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Brightness"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_receive_brightness(!id(${wled_id})->get_receive_brightness());'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_sy_fx
+            x: 2
+            y: 54
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Effects"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_receive_effects(!id(${wled_id})->get_receive_effects());'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_sy_change
+            x: 122
+            y: 54
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "On change"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_send_on_change(!id(${wled_id})->get_send_on_change());'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_sy_retx
+            x: 2
+            y: 80
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Retransmit"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_retransmit(!id(${wled_id})->get_retransmit());'
+              - script.execute: wl_ui_mark_choices
+        - label:
+            x: 122
+            y: 80
+            width: 116
+            text_font: montserrat_12
+            long_mode: wrap
+            text: "green = on"
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Settings"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_settings
+
+    # ── Sync groups (green = member) ───────────────────────────────
+    - id: wl_page_groups
+      on_load:
+        - script.execute: wl_ui_mark_choices
+        - script.execute:
+            id: wl_ui_focus_page
+            page: 7
+      widgets:
+        - label:
+            x: 2
+            y: 0
+            styles: wl_st_line
+            text: "Send to groups:"
+        - button:
+            id: wl_btn_gs1
+            x: 2
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "1"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 1, !(id(${wled_id})->get_send_groups() & 0x01));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs2
+            x: 31
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "2"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 2, !(id(${wled_id})->get_send_groups() & 0x02));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs3
+            x: 60
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "3"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 3, !(id(${wled_id})->get_send_groups() & 0x04));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs4
+            x: 89
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "4"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 4, !(id(${wled_id})->get_send_groups() & 0x08));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs5
+            x: 118
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "5"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 5, !(id(${wled_id})->get_send_groups() & 0x10));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs6
+            x: 147
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "6"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 6, !(id(${wled_id})->get_send_groups() & 0x20));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs7
+            x: 176
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "7"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 7, !(id(${wled_id})->get_send_groups() & 0x40));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gs8
+            x: 205
+            y: 16
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "8"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(true, 8, !(id(${wled_id})->get_send_groups() & 0x80));'
+              - script.execute: wl_ui_mark_choices
+        - label:
+            x: 2
+            y: 44
+            styles: wl_st_line
+            text: "Receive from groups:"
+        - button:
+            id: wl_btn_gr1
+            x: 2
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "1"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 1, !(id(${wled_id})->get_receive_groups() & 0x01));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr2
+            x: 31
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "2"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 2, !(id(${wled_id})->get_receive_groups() & 0x02));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr3
+            x: 60
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "3"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 3, !(id(${wled_id})->get_receive_groups() & 0x04));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr4
+            x: 89
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "4"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 4, !(id(${wled_id})->get_receive_groups() & 0x08));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr5
+            x: 118
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "5"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 5, !(id(${wled_id})->get_receive_groups() & 0x10));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr6
+            x: 147
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "6"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 6, !(id(${wled_id})->get_receive_groups() & 0x20));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr7
+            x: 176
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "7"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 7, !(id(${wled_id})->get_receive_groups() & 0x40));'
+              - script.execute: wl_ui_mark_choices
+        - button:
+            id: wl_btn_gr8
+            x: 205
+            y: 60
+            width: 27
+            height: 24
+            widgets:
+              - label:
+                  text: "8"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(${wled_id})->set_group_bit(false, 8, !(id(${wled_id})->get_receive_groups() & 0x80));'
+              - script.execute: wl_ui_mark_choices
+        - label:
+            id: wl_lbl_groups
+            x: 2
+            y: 90
+            styles: wl_st_line
+            long_mode: dot
+            text: ""
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Settings"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: wl_page_settings
+
+interval:
+  # Buttons: activity timestamp, swallow the wake-up press.
+  - interval: 20ms
+    then:
+      - lambda: |-
+          bool any = id(${key_left}).state || id(${key_right}).state;
+          static bool first = true;
+          if (first) {
+            first = false;
+            id(wl_ui_apply_rotation).execute();
+            // Woken by a button press: ignore it until it is released.
+            id(wl_ui_swallow) = any;
+          }
+          if (any)
+            id(wl_ui_last_act) = millis();
+          else
+            id(wl_ui_swallow) = false;
+
+  # LEDs follow the light (fast enough for pulse / strobe effects).
+  - interval: 50ms
+    then:
+      - script.execute: wl_ui_led
+
+  - interval: 1s
+    then:
+      # Deep sleep (screen off) after inactivity, unless set to "never".
+      - if:
+          condition:
+            lambda: |-
+              static const uint32_t SLEEP_S[4] = {30, 60, 180, 300};
+              uint8_t i = id(wl_ui_sleep_idx);
+              return i < 4 && millis() - id(wl_ui_last_act) >= SLEEP_S[i] * 1000u;
+          then:
+            - logger.log: "No button pressed for the sleep timeout - entering deep sleep"
+            - light.turn_off: ${backlight_id}
+            - deep_sleep.enter: ${deep_sleep_id}
+      - script.execute: wl_ui_refresh

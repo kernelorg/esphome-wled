@@ -1,0 +1,216 @@
+# Monochrome WLED lamp on an ESP8266 (NodeMCU): one PWM channel driving an
+# LED lamp through a low-side transistor (D1, active low, 1 kHz).
+#
+# The lamp behaves like a WLED node:
+#   - follows WLED sync packets (brightness, pulse / strobe effects) and
+#     realtime (WARLS / DRGB / … / TPM2.NET) from other WLED nodes;
+#   - with "Sync send" on, its own changes are broadcast to the send groups;
+#   - shows up in other nodes' "Network Nodes" list, answers the WLED HTTP
+#     API (/json/*, /win) and has /sync (group matrix) and /nodes pages;
+#   - the sync switches below (wled_emu switch platform) are saved and
+#     restored after a reboot; changes on the /sync page show up in them.
+#
+# Wi-Fi credentials: copy secrets.yaml.example to secrets.yaml.
+
+esphome:
+  name: wled-lamp
+  friendly_name: WLED lamp
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # - source: github://kernelorg/esphome-wled@main
+    components:
+      - wled_emu
+
+esp8266:
+  board: nodemcuv2
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:                     # fallback hotspot if the network is unreachable
+
+captive_portal:
+
+# The WLED apps discover nodes via mDNS.
+mdns:
+  services:
+    - service: "_wled"
+      protocol: "_tcp"
+      port: 80
+
+web_server:
+  port: 80
+  version: 3
+
+output:
+  - platform: esp8266_pwm
+    id: lamp_pwm
+    pin: D1
+    frequency: 1000 Hz
+    inverted: true           # the transistor stage switches on with a low pin
+
+# The light's effects; which WLED effect each one stands for is set in
+# wled_emu → effects (WLED IDs: see WLED_EFFECTS.md).
+light:
+  - platform: monochromatic
+    id: lamp
+    name: "Lamp"
+    output: lamp_pwm
+    effects:
+      - pulse:
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 0.5s
+          update_interval: 0.5s
+          min_brightness: 20%
+          max_brightness: 100%
+      - pulse:
+          name: "Slow Pulse"
+          update_interval: 2s
+      - pulse:
+          name: "Asymmetrical Pulse"
+          transition_length:
+            on_length: 1s
+            off_length: 500ms
+          update_interval: 1.5s
+      - strobe:
+      - strobe:
+          name: "Fast strobe"
+          colors:
+            - state: true
+              brightness: 100%
+              duration: 20ms
+            - state: false
+              duration: 20ms
+
+wled_emu:
+  id: wled
+  light_id: lamp
+  http_api: true
+  # ESPHome effect ↔ WLED effects. Received: any listed ID plays the effect
+  # (an unlisted one plays none); sent: the effect goes out as its first ID.
+  # Only effects that work on one LED make sense here (WLED_EFFECTS.md).
+  effects:
+    - effect: "Pulse"
+      wled:
+        - 2      # Breathe
+    - effect: "Fast Pulse"
+      wled:
+        - 2      # Breathe (received 2 plays "Pulse", listed first)
+    - effect: "Slow Pulse"
+      wled:
+        - 12     # Fade
+    - effect: "Asymmetrical Pulse"
+      wled:
+        - 100    # Heartbeat
+    - effect: "Strobe"
+      wled:
+        - 23     # Strobe
+        - 24     # Strobe Rainbow
+        - 26     # Blink Rainbow
+    - effect: "Fast strobe"
+      wled:
+        - 25     # Strobe Mega
+        - 1      # Blink
+  send_groups: 0x01
+  receive_groups: 0x01
+  on_node_seen:
+    - logger.log:
+        format: "WLED peer %s (%s)"
+        args:
+          - 'ip.c_str()'
+          - 'name.c_str()'
+
+# Runtime settings as switches (Home Assistant / web page). The state is
+# saved; with nothing saved yet the wled_emu values above are used.
+switch:
+  - platform: wled_emu
+    type: sync
+    name: "Sync"
+    icon: "mdi:sync"
+  - platform: wled_emu
+    type: sync_receive
+    name: "Sync receive"
+    icon: "mdi:download-network"
+  - platform: wled_emu
+    type: sync_send
+    name: "Sync send"
+    icon: "mdi:upload-network"
+  - platform: wled_emu
+    type: receive_effects
+    name: "Receive effects"
+    entity_category: config
+  - platform: wled_emu
+    type: send_group
+    group: 1
+    name: "Send group 1"
+    entity_category: config
+  - platform: wled_emu
+    type: send_group
+    group: 2
+    name: "Send group 2"
+    entity_category: config
+  - platform: wled_emu
+    type: receive_group
+    group: 1
+    name: "Receive group 1"
+    entity_category: config
+  - platform: wled_emu
+    type: receive_group
+    group: 2
+    name: "Receive group 2"
+    entity_category: config
+
+button:
+  # Make every lamp in the send groups pulse — e.g. as a doorbell signal.
+  - platform: template
+    name: "Pulse all lamps"
+    on_press:
+      - wled_emu.send_notifier:
+          brightness: 255
+          effect: "Pulse"    # sent as its WLED ID from `effects:` (2 Breathe)
+  - platform: template
+    name: "All lamps off"
+    on_press:
+      - wled_emu.send_notifier:
+          "on": false
+
+# Status for Home Assistant / the web page.
+sensor:
+  - platform: wled_emu
+    type: peers
+    name: "WLED peers"
+binary_sensor:
+  - platform: wled_emu
+    type: realtime
+    name: "Realtime"
+text_sensor:
+  - platform: wled_emu
+    type: last_packet
+    name: "Last WLED packet"
+  - platform: wled_emu
+    type: peers
+    name: "WLED peer list"
+
+# UDP ports, saved over a reboot (defaults: 21324 / 65506).
+number:
+  - platform: wled_emu
+    type: port
+    name: "UDP port"
+    mode: box
+    entity_category: config
+  - platform: wled_emu
+    type: info_port
+    name: "Discovery port"
+    mode: box
+    entity_category: config

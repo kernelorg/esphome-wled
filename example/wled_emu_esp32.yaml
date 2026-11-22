@@ -1,0 +1,55 @@
+# ESP32 send-only controller: broadcasts WLED notifiers on demand and
+# keeps a table of WLED peers (no light bound → no sync listener).
+esphome:
+  name: wled-emu-32
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # - source: github://kernelorg/esphome-wled@main
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+api:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+wled_emu:
+  id: wled
+  send_groups: 0x03
+
+button:
+  - platform: template
+    name: "Red pulse"
+    on_press:
+      - wled_emu.send_notifier:
+          brightness: 200
+          red: 255
+          green: 0
+          blue: 0
+          wled_effect: 2     # WLED Breathe (IDs: WLED_EFFECTS.md)
+  - platform: template
+    name: "All off"
+    on_press:
+      - wled_emu.send_notifier:
+          "on": false
+
+sensor:
+  - platform: wled_emu
+    type: peers
+    name: "WLED peers"
+  - platform: wled_emu
+    type: tx_packets
+    name: "Packets sent"
+
+text_sensor:
+  - platform: wled_emu
+    type: peers
+    name: "WLED peer list"

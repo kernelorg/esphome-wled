@@ -1,0 +1,251 @@
+# WLED emulation debug firmware for a LilyGO T-Display (ESP32, ST7789 240×135):
+# wled_emu + the optional LVGL debug UI (ui/lvgl_debug.yaml).
+#
+# The "lamp" is a virtual RGB light shown as a round LED on the screen: WLED
+# sync / realtime packets from other nodes change it, and changing it on the
+# Lamp page broadcasts it (with "Send" sync on). The HTTP API and mDNS make
+# it show up in the WLED app.
+#
+# Wi-Fi: no network in the config — on first boot send one with an Improv
+# client (Home Assistant / ESPHome app or https://www.improv-wifi.com in
+# Chrome). Net → "Forget Wi-Fi" asks again.
+#
+# Buttons: left = next button, right = press (they swap with the screen
+# flipped, so they always match what you see); either button wakes the board
+# from deep sleep.
+
+substitutions:
+  device_name: wled-debug
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # - source: github://kernelorg/esphome-wled@main
+    components:
+      - wled_emu
+
+packages:
+  wled_ui: !include
+    file: ../ui/lvgl_debug.yaml
+    vars:
+      wled_id: wled
+      light_id: lamp
+      display_id: lcd
+      rotation: "90"            # landscape; the Settings page can flip it 180°
+      key_left: btn_left
+      key_right: btn_right
+      backlight_id: backlight
+      deep_sleep_id: deep_sleep_ctl
+
+esphome:
+  name: ${device_name}
+  on_boot:
+    priority: 600
+    then:
+      # Release the backlight pin held low during deep sleep.
+      - lambda: 'gpio_hold_dis(GPIO_NUM_4);'
+  on_shutdown:
+    then:
+      # Before deep sleep: keep the backlight transistor off (GPIO4 would
+      # otherwise float and the backlight may glow).
+      - lambda: |-
+          gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+          gpio_set_level(GPIO_NUM_4, 0);
+          gpio_hold_en(GPIO_NUM_4);
+          gpio_deep_sleep_hold_en();
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  logs:
+    lvgl: INFO
+    light: INFO
+    component: ERROR
+
+# ── Network: the network comes from Improv BLE ─────────────────────────
+wifi:
+
+esp32_ble:
+
+improv_ble:
+  authorizer: none
+
+ota:
+  - platform: esphome
+
+mdns:
+  services:
+    - service: "_wled"
+      protocol: "_tcp"
+      port: 80
+
+web_server:
+  port: 80
+  version: 3
+
+# ── The lamp: a virtual RGB light, shown on the screen ─────────────────
+output:
+  - platform: template
+    id: lamp_r
+    type: float
+    write_action:
+      - lambda: ''
+  - platform: template
+    id: lamp_g
+    type: float
+    write_action:
+      - lambda: ''
+  - platform: template
+    id: lamp_b
+    type: float
+    write_action:
+      - lambda: ''
+  - platform: ledc
+    pin: GPIO4
+    id: backlight_out
+
+light:
+  - platform: rgb
+    id: lamp
+    name: "Lamp"
+    red: lamp_r
+    green: lamp_g
+    blue: lamp_b
+    default_transition_length: 300ms
+    effects:
+      - pulse:
+      - strobe:
+  - platform: monochromatic
+    id: backlight
+    output: backlight_out
+    restore_mode: ALWAYS_ON
+    internal: true
+    default_transition_length: 0s
+
+wled_emu:
+  id: wled
+  light_id: lamp
+  http_api: true
+  sync_send: true
+  sync_receive: true
+  send_groups: 0x01
+  receive_groups: 0x01
+  effects:
+    - effect: "Pulse"
+      wled:
+        - 2      # Breathe
+        - 12     # Fade
+    - effect: "Strobe"
+      wled:
+        - 23     # Strobe
+        - 25     # Strobe Mega
+  on_node_seen:
+    - logger.log:
+        format: "WLED peer %s (%s)"
+        args:
+          - 'ip.c_str()'
+          - 'name.c_str()'
+  on_groups_change:
+    - logger.log:
+        format: "sync groups: send 0x%02X, receive 0x%02X"
+        args:
+          - 'send'
+          - 'recv'
+
+# Runtime settings as switches (web page / Home Assistant), saved over a
+# reboot; the debug UI's Sync page and these stay in step.
+switch:
+  - platform: wled_emu
+    type: sync_send
+    name: "Sync send"
+  - platform: wled_emu
+    type: sync_receive
+    name: "Sync receive"
+  - platform: wled_emu
+    type: receive_group
+    group: 2
+    name: "Receive group 2"
+
+sensor:
+  - platform: wled_emu
+    type: peers
+    name: "WLED peers"
+  - platform: wled_emu
+    type: rx_packets
+    name: "Packets received"
+  - platform: wled_emu
+    type: tx_packets
+    name: "Packets sent"
+
+text_sensor:
+  - platform: wled_emu
+    type: last_packet
+    name: "Last WLED packet"
+  - platform: wled_emu
+    type: last_sender
+    name: "Last sender"
+  - platform: wled_emu
+    type: peers
+    name: "WLED peer list"
+
+number:
+  - platform: wled_emu
+    type: port
+    name: "UDP port"
+    mode: box
+
+# ── Deep sleep: entered by the UI after the chosen inactivity timeout,
+#    woken by either button (both are active-low). ─────────────────────
+deep_sleep:
+  id: deep_sleep_ctl
+  wakeup_pin:
+    number: GPIO0
+    inverted: true
+    allow_other_uses: true
+    mode:
+      input: true
+      pullup: true
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO35
+        allow_other_uses: true
+    mode: ALL_LOW
+
+# ── T-Display hardware ─────────────────────────────────────────────────
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: T-DISPLAY
+    reset_pin: GPIO23
+
+binary_sensor:
+  - platform: wled_emu
+    type: realtime
+    name: "Realtime"
+  - platform: gpio
+    id: btn_left
+    pin:
+      number: GPIO0
+      inverted: true
+      allow_other_uses: true
+      mode:
+        input: true
+        pullup: true
+  - platform: gpio
+    id: btn_right
+    # GPIO35 is input-only with an external pull-up on the T-Display.
+    pin:
+      number: GPIO35
+      inverted: true
+      allow_other_uses: true
+      mode:
+        input: true
